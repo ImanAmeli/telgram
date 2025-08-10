@@ -137,6 +137,149 @@ async function ensureSchema() {
   `);
 }
 
+// Helpers
+async function findUserByUsername(username) {
+  if (!username) return null;
+  const clean = username.replace(/^@/, '').trim();
+  const q = await pg.query('SELECT * FROM people WHERE username=$1', [clean]);
+  return q.rows[0] || null;
+}
+
+// Create task
+app.post("/api/task", async (req, res) => {
+  try {
+    const { title, due, assignee_username, description, instructions, refs, prereq_ids } = req.body || {};
+    if (!title) return res.status(400).json({ error: "title_required" });
+
+    let assignee_id = null;
+    if (assignee_username) {
+      const u = await findUserByUsername(assignee_username);
+      if (u) assignee_id = u.id;
+    }
+
+    const ins = await pg.query(
+      `INSERT INTO tasks(title, due, assignee_id, description, instructions)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [title, due || null, assignee_id, description || null, instructions || null]
+    );
+    const taskId = ins.rows[0].id;
+
+    if (Array.isArray(refs)) {
+      for (const r of refs) {
+        if (r?.url) {
+          await pg.query(`INSERT INTO task_refs(task_id, url, caption) VALUES ($1,$2,$3)`, [taskId, r.url, r.caption || null]);
+        }
+      }
+    }
+    if (Array.isArray(prereq_ids)) {
+      for (const pid of prereq_ids) {
+        if (pid && Number.isInteger(pid)) {
+          await pg.query(`INSERT INTO task_deps(task_id, requires_task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [taskId, pid]);
+        }
+      }
+    }
+
+    res.json({ ok: true, id: taskId });
+  } catch (e) { console.error(e); res.status(500).json({ error: "create_failed" }); }
+});
+
+// Update task (partial)
+app.patch("/api/task/:id", async (req, res) => {
+  try {
+    const id = +req.params.id;
+    const { title, due, assignee_username, status, description, instructions } = req.body || {};
+
+    let assignee_id = undefined;
+    if (assignee_username !== undefined) {
+      const u = await findUserByUsername(assignee_username);
+      assignee_id = u ? u.id : null;
+    }
+
+    const sets = [];
+    const vals = [];
+    const push = (k, v) => { sets.push(k); vals.push(v); };
+
+    if (title !== undefined) push(`title=$${vals.length+1}`, title);
+    if (due !== undefined) push(`due=$${vals.length+1}`, due || null);
+    if (assignee_username !== undefined) push(`assignee_id=$${vals.length+1}`, assignee_id);
+    if (status !== undefined) push(`status=$${vals.length+1}`, status);
+    if (description !== undefined) push(`description=$${vals.length+1}`, description);
+    if (instructions !== undefined) push(`instructions=$${vals.length+1}`, instructions);
+
+    if (!sets.length) return res.json({ ok: true, id });
+
+    vals.push(id);
+    await pg.query(`UPDATE tasks SET ${sets.join(',')} WHERE id=$${vals.length}`, vals);
+    res.json({ ok: true, id });
+  } catch (e) { console.error(e); res.status(500).json({ error: "update_failed" }); }
+});
+
+// Add reference
+app.post("/api/task/:id/ref", async (req, res) => {
+  try {
+    const id = +req.params.id;
+    const { url, caption } = req.body || {};
+    if (!url) return res.status(400).json({ error: "url_required" });
+    await pg.query(`INSERT INTO task_refs(task_id, url, caption) VALUES ($1,$2,$3)`, [id, url, caption || null]);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "ref_failed" }); }
+});
+
+// Add prerequisite
+app.post("/api/task/:id/prereq", async (req, res) => {
+  try {
+    const id = +req.params.id;
+    const { requires_task_id } = req.body || {};
+    if (!requires_task_id) return res.status(400).json({ error: "requires_task_id_required" });
+    await pg.query(`INSERT INTO task_deps(task_id, requires_task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, requires_task_id]);
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: "prereq_failed" }); }
+});
+
+// Get task (with refs + prereqs)
+app.get("/api/task/:id", async (req, res) => {
+  try {
+    const id = +req.params.id;
+    const t = await pg.query(`
+      SELECT t.*, COALESCE(p.username,'') assignee_username
+      FROM tasks t LEFT JOIN people p ON p.id=t.assignee_id
+      WHERE t.id=$1
+    `, [id]);
+    if (!t.rows[0]) return res.status(404).json({ error: "not_found" });
+
+    const refs = await pg.query(`SELECT id, url, caption FROM task_refs WHERE task_id=$1 ORDER BY id`, [id]);
+    const deps = await pg.query(`
+      SELECT d.requires_task_id AS id, tt.title
+      FROM task_deps d JOIN tasks tt ON tt.id=d.requires_task_id
+      WHERE d.task_id=$1 ORDER BY 1
+    `, [id]);
+
+    res.json({ ...t.rows[0], refs: refs.rows, prereqs: deps.rows });
+  } catch (e) { console.error(e); res.status(500).json({ error: "get_failed" }); }
+});
+
+// List tasks with filters
+app.get("/api/tasks", async (req, res) => {
+  try {
+    const { status, due, assignee } = req.query;
+    const wh = [];
+    const vals = [];
+
+    if (status) { vals.push(String(status)); wh.push(`t.status=$${vals.length}`); }
+    if (due) { vals.push(String(due)); wh.push(`t.due=$${vals.length}`); }
+    if (assignee) { vals.push(String(assignee).replace(/^@/,'')); wh.push(`p.username=$${vals.length}`); }
+
+    const sql = `
+      SELECT t.id, t.title, t.due, t.status, COALESCE(p.username,'') assignee
+      FROM tasks t LEFT JOIN people p ON p.id=t.assignee_id
+      ${wh.length ? 'WHERE ' + wh.join(' AND ') : ''}
+      ORDER BY t.due NULLS LAST, t.id DESC
+    `;
+    const { rows } = await pg.query(sql, vals);
+    res.json(rows);
+  } catch (e) { console.error(e); res.status(500).json({ error: "list_failed" }); }
+});
 
 app.listen(PORT, async () => {
   await ensureSchema();
