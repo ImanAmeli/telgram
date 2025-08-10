@@ -83,7 +83,7 @@ app.get("/api/digest", async (req, res) => {
   }
 });
 
-// بوت‌استرپ اسکیما مینیمال (اگر نبود بساز)
+// --- جایگزین ensureSchema قبلی کن ---
 async function ensureSchema() {
   await pg.query(`
     CREATE TABLE IF NOT EXISTS people (
@@ -91,7 +91,7 @@ async function ensureSchema() {
       name text NOT NULL,
       role text,
       telegram_id bigint,
-      username text,
+      username text UNIQUE,
       created_at timestamptz DEFAULT NOW()
     );
     DO $$
@@ -112,12 +112,31 @@ async function ensureSchema() {
       assignee_id int REFERENCES people(id) ON DELETE SET NULL,
       due date,
       status task_status DEFAULT 'todo',
+      description text,
+      instructions text,
       created_at timestamptz DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due);
     CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+    CREATE TABLE IF NOT EXISTS task_refs (
+      id serial PRIMARY KEY,
+      task_id int NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      url text NOT NULL,
+      caption text,
+      created_at timestamptz DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS task_deps (
+      task_id int NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      requires_task_id int NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      created_at timestamptz DEFAULT NOW(),
+      PRIMARY KEY(task_id, requires_task_id),
+      CHECK (task_id <> requires_task_id)
+    );
   `);
 }
+
 
 app.listen(PORT, async () => {
   await ensureSchema();
