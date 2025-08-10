@@ -1,0 +1,57 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: n8n
+      TZ: ${TZ}
+    volumes:
+      - pg:/var/lib/postgresql/data
+    networks: [web]
+
+  valkey:
+    image: valkey/valkey:7
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    networks: [web]
+
+  app:
+    build: ./app
+    restart: unless-stopped
+    depends_on: [db, valkey]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      TZ: ${TZ}
+      # App env
+      DATABASE_URL: postgres://n8n:${POSTGRES_PASSWORD}@db:5432/n8n
+      VALKEY_URL: redis://valkey:6379
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      PUBLIC_APP_URL: https://${DOMAIN}
+      DAILY_DIGEST_CHAT_ID: ${DAILY_DIGEST_CHAT_ID}
+    networks: [web]
+
+  caddy:
+    image: caddy:latest
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      EMAIL: ${EMAIL}
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [web]
+
+networks:
+  web:
+
+volumes:
+  pg:
+  caddy_data:
+  caddy_config:
